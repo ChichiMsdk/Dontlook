@@ -149,30 +149,6 @@ LARGE_INTEGER start;
 LARGE_INTEGER end;
 double elapsedTime;
 
-void
-fn(float duration, int samples, void *buffer, SDL_AudioStream *stream)
-{
-    // Get the starting time
-	size_t offset;
-	static uint64_t count = 1;
-
-    QueryPerformanceCounter(&end);
-	offset = count * samples;
-
-    elapsedTime = (double)(end.QuadPart - start.QuadPart) / frequency.QuadPart;
-	elapsedTime *= 1000;
-	if (elapsedTime >= duration)
-	{
-		void *tmp = (char *) buffer + offset;
-		if (SDL_PutAudioStreamData(stream, tmp, samples) < 0)
-		{
-			fprintf(stderr, "Could not open audio: %s\n", SDL_GetError());
-			SDL_free(tmp);
-			SDL_Quit();
-		}
-		QueryPerformanceCounter(&start);
-	}
-}
 
 void
 print_wav_header(t_wav header)
@@ -212,7 +188,7 @@ load_full_wav(const char *fpath)
 	if (count < 0)
 		logExit("fread failed");
 	a_data.header = header;
-	print_wav_header(header);
+	/* print_wav_header(header); */
 
 	/* dont trust riff header since it can provide wrong size... */
 	int offset = ftell(fd);
@@ -255,117 +231,134 @@ load_full_wav(const char *fpath)
 unsigned int array_of_shame[] = {
 	SDL_AUDIO_U8, SDL_AUDIO_S8, SDL_AUDIO_S16, SDL_AUDIO_S32, SDL_AUDIO_F32};
 
+typedef struct poubelle
+{
+	size_t	wav_length;
+	float	sample;
+	float	duration;
+	SDL_AudioStream	*stream;
+	uint8_t *buffer;
+}poubelle;
+
+HANDLE ghMutex;
+
+void
+fn(float duration, int samples, uint8_t *buffer, SDL_AudioStream *stream, size_t wav_length)
+{
+	size_t offset;
+	static uint64_t count = 1;
+	if (count == 1)
+		QueryPerformanceCounter(&start);
+    QueryPerformanceCounter(&end);
+	offset = count * samples;
+	if (offset > wav_length-3000)
+	{
+		count = 0;
+		offset = count * samples;
+	}
+	count++;
+    elapsedTime = (double)(end.QuadPart - start.QuadPart) / frequency.QuadPart;
+	elapsedTime *= 1000;
+	/* if (elapsedTime >= duration) */
+	Sleep(duration*100);
+	{
+		uint8_t *tmp = buffer + offset;
+		if (SDL_PutAudioStreamData(stream, tmp, samples) < 0)
+		{
+			fprintf(stderr, "Could not open audio: %s\n", SDL_GetError());
+			SDL_free(tmp);
+			SDL_Quit();
+		}
+		QueryPerformanceCounter(&start);
+	}
+}
+
+#define MAX_THREADS 3
+#define BUF_SIZE 255
+
+DWORD WINAPI 
+MyThreadFunction(LPVOID l)
+{
+	while (g_running == 1)
+	{
+		poubelle p = *(poubelle*)l;
+		DWORD waitR;
+		waitR = WaitForSingleObject(ghMutex, INFINITE);
+		switch (waitR)
+		{
+			case WAIT_OBJECT_0:
+				__try{if (g_sending == 0)
+					fn(p.duration, p.sample, p.buffer, p.stream, p.wav_length);
+				}
+				__finally{
+					if (!ReleaseMutex(ghMutex))
+						printf("failed releasing\n");
+				}
+				break;
+			case WAIT_ABANDONED:
+				return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+void ErrorHandler(LPCTSTR lpszFunction);
+
 int
 main()
 {
-	init_sdl();
-	SDL_AudioSpec wav_spec;
-	Uint8 *wav_buffer = NULL;
-	Uint32 wav_length;
-	/* const char *audio_file = "EE_VictoryMusic.wav"; */
-	const char *audio_file = "beethoven_third_movement_moonlight_sonata.wav";
-    /*
-	 * if (SDL_LoadWAV(audio_file, &wav_spec, &wav_buffer, &wav_length) == -1) {
-	 * 	fprintf(stderr, "Could not open %s: %s\n", audio_file, SDL_GetError());
-	 * 	SDL_Quit();
-	 * 	return 1;
-	 * }
-     */
-
-	SDL_free(wav_buffer);
-	wav_buffer = NULL;
-	AudioData data = load_full_wav(audio_file);
-	wav_spec.freq = data.header.srate;
-	wav_spec.channels = data.header.num_chans;
-	wav_buffer = data.buffer;
-	wav_length = data.header.dlength;
-	wav_spec.format = SDL_AUDIO_S16; /* I guess it's the most common one ?.. */
-
-	/* shame on me .. for not willing to parse that shit*/
-	int i = 0;
-	uint64_t idiot;
-	while (1)
-	{
-		if (((idiot = wav_length % SDL_AUDIO_FRAMESIZE(wav_spec))) == 0)
-		{
-			printf("idiot: %u\n", wav_spec.format);
-			printf("i: %d\n", i);
-			if (wav_spec.format >= 3284)
-				break;
+		init_sdl();
+		SDL_AudioSpec wav_spec;
+		Uint8 *wav_buffer = NULL;
+		Uint32 wav_length;
+		const char *audio_file = "EE_VictoryMusic.wav";
+		/* const char *audio_file = "beethoven_third_movement_moonlight_sonata.wav"; */
+		if (SDL_LoadWAV(audio_file, &wav_spec, &wav_buffer, &wav_length) == -1) {
+			fprintf(stderr, "Could not open %s: %s\n", audio_file, SDL_GetError());
+			SDL_Quit();
+			return 1;
 		}
-		if (i >= 5)
+		printf("format %d\n", wav_spec.format);
+		printf("%d\n", wav_length);
+		SDL_AudioStream *audio_stream = SDL_CreateAudioStream(&wav_spec, &wav_spec);
+		if (audio_stream == NULL) 
 		{
-			printf("LOSER AHAHA\n");
-			exit(1);
+			fprintf(stderr, "Could not create audio stream: %s\n", SDL_GetError());
+			SDL_free(wav_buffer);
+			SDL_Quit();
+			return 1;
 		}
-		wav_spec.format = array_of_shame[i];
-		printf("HAHAHAHHAAH\n");
-		i++;
-	}
-	/*
-	 * either this works and I am genius, or it just miserably fails and either
-	 * you get a clean superb lovely abort or ... an awful sound that will just
-	 * destroy your ears .. so keep the volume low, very low.
-	 */
+		SDL_AudioDeviceID devid;
+		SDL_AudioSpec dev_spec;
+		int	sample_frames;
+		if ((devid = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_OUTPUT, NULL)) < 0) { fprintf(stderr, "Could not open audio: %s\n", SDL_GetError()); SDL_free(wav_buffer); SDL_Quit(); return 1; }
+		SDL_BindAudioStream(devid, audio_stream);
+		SDL_PauseAudioDevice(devid);
+		g_inst.capture_id = devid;
+		g_inst.stream = audio_stream;
 
-	printf("format %d\n", wav_spec.format);
-
-	printf("%d\n", wav_length);
-	SDL_AudioStream *audio_stream = SDL_CreateAudioStream(&wav_spec, &wav_spec);
-	if (audio_stream == NULL) 
-	{
-		fprintf(stderr, "Could not create audio stream: %s\n", SDL_GetError());
-		SDL_free(wav_buffer);
-		SDL_Quit();
-		return 1;
-	}
-	if (SDL_PutAudioStreamData(audio_stream, wav_buffer, wav_length) < 0)
-	{
-		fprintf(stderr, "Error putting data to audio stream: %s\n", SDL_GetError());
-		SDL_free(wav_buffer);
-		SDL_Quit();
-		return 1;
-	}
-	SDL_AudioDeviceID devid;
-	if ((devid = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_OUTPUT, NULL)) < 0)
-	{
-		fprintf(stderr, "Could not open audio: %s\n", SDL_GetError());
-		SDL_free(wav_buffer);
-		SDL_Quit();
-		return 1;
-	}
-	SDL_AudioSpec dev_spec;
-	int	sample_frames;
-	SDL_GetAudioDeviceFormat(devid, &dev_spec, &sample_frames);
-	printf("dev_freq %d\n sample %d\n", dev_spec.freq, sample_frames);
-
-	SDL_GetAudioStreamFormat(audio_stream, &dev_spec, &wav_spec);
-	printf("%d\n %d\n", dev_spec.freq, wav_spec.freq);
-
-	SDL_BindAudioStream(devid, audio_stream);
-
-	SDL_PauseAudioDevice(devid);
-
-	size_t bytes = SDL_GetAudioStreamAvailable(audio_stream);
-	printf("bytes: %llu\n", bytes);
-
-	g_inst.capture_id = devid;
-	g_inst.stream = audio_stream;
-
-    QueryPerformanceFrequency(&frequency);
-	float sample = 4096;
-	float duration = (sample / wav_spec.freq) * 1000;
+		QueryPerformanceFrequency(&frequency);
+	float sample = 2*1000;
+	float duration = (sample / wav_spec.freq) * 100;
 	printf("%f ms of time to process\n", duration);
+	ghMutex = CreateMutex( NULL, FALSE, NULL);  
+
+	poubelle Data = {.duration = duration, .sample = sample, .stream = audio_stream, .buffer = wav_buffer, .wav_length = wav_length};
+	DWORD threadID;
+	HANDLE hThread = CreateThread(NULL, 0, MyThreadFunction, &Data, 0, &threadID);
+
 	while(g_running == 1)
 	{
-		/* if (g_retrieving == 0) */
-			/* fn(duration, sample, wav_buffer, audio_stream); */
 		Events(g_inst.e, NULL);
 	}
 
+	WaitForMultipleObjects(1, hThread, TRUE, INFINITE);
+	CloseHandle(hThread);
+	CloseHandle(ghMutex);
+
 	SDL_CloseAudioDevice(devid);
-	free(data.buffer);
-	/* SDL_free(wav_buffer); */
+	/* free(data.buffer); */
+	 SDL_free(wav_buffer);
 	SDL_DestroyRenderer(g_inst.renderer);
 	SDL_DestroyWindow(g_inst.window);
 	SDL_Quit();
@@ -380,3 +373,43 @@ logExit(char *msg)
 	SDL_Quit();
 	exit(1);
 }
+    /*
+	 * SDL_free(wav_buffer);
+	 * wav_buffer = NULL;
+	 * AudioData data = load_full_wav(audio_file);
+	 * wav_spec.freq = data.header.srate;
+	 * wav_spec.channels = data.header.num_chans;
+	 * wav_buffer = data.buffer;
+	 * wav_length = data.header.dlength;
+     */
+	/* I guess it's the most common one ?.. */
+	/* wav_spec.format = SDL_AUDIO_S16; */
+
+	/* shame on me .. for not willing to parse that shit*/
+    /*
+	 * int i = 0;
+	 * uint64_t idiot;
+	 * while (1)
+	 * {
+	 * 	if (((idiot = wav_length % SDL_AUDIO_FRAMESIZE(wav_spec))) == 0)
+	 * 	{
+	 * 		printf("idiot: %u\n", wav_spec.format);
+	 * 		printf("i: %d\n", i);
+	 * 		if (wav_spec.format >= 3284)
+	 * 			break;
+	 * 	}
+	 * 	if (i >= 5)
+	 * 	{
+	 * 		printf("LOSER AHAHA\n");
+	 * 		exit(1);
+	 * 	}
+	 * 	wav_spec.format = array_of_shame[i];
+	 * 	printf("HAHAHAHHAAH\n");
+	 * 	i++;
+	 * }
+     */
+	/*
+	 * either this works and I am genius, or it just miserably fails and either
+	 * you get a clean superb lovely abort or ... an awful sound that will just
+	 * destroy your ears .. so keep the volume low, very low.
+	 */
